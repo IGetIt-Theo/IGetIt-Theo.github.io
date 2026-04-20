@@ -57,7 +57,9 @@ for category in categories:
             'product_id': product_id,
             'product_name': f'{category} Product {i+1}',
             'category': category,
-            'price': price
+            'price': price,
+            'cost': cost,
+            'margin': margin
         })
         product_id += 1
 
@@ -211,8 +213,9 @@ for cust_id, frequency in customer_frequencies.items():
         # Create line items for this transaction
         for prod_id in product_ids:
             quantity = np.random.choice([1, 2, 3], p=[0.85, 0.12, 0.03])
+            discount = np.random.uniform(0.0, 0.25)
             price = products.loc[products['product_id'] == prod_id, 'price'].values[0]
-            
+            cost = products.loc[products['product_id'] == prod_id, 'cost'].values[0]
             transactions.append({
                 'transaction_id': transaction_id,
                 'datetime': random_date,
@@ -220,8 +223,10 @@ for cust_id, frequency in customer_frequencies.items():
                 'customer_id': cust_id,
                 'product_id': prod_id,
                 'quantity': quantity,
-                'unit_price': price,
-                'total_price': round(price * quantity, 2)
+                'unit_price': price * (1-discount),
+                'total_price': round(price * (1-discount) * quantity, 2),
+                'cost': cost,
+                'total_cost': round(cost * quantity, 2)
             })
         
         transaction_id += 1
@@ -294,10 +299,10 @@ print(f"  One-time buyers: {one_time_customers} ({one_time_customers/num_custome
 print(f"  Regular customers: {regular_customers} ({regular_customers/num_customers*100:.1f}%)")
 
 # Save to CSV files
-stores.to_csv('code/python/dim_stores.csv', index=False)
-products.to_csv('code/python/dim_products.csv', index=False)
-customers.to_csv('code/python/dim_customers.csv', index=False)
-sales_fact.to_csv('code/python/fact_sales.csv', index=False)
+stores.to_csv('dim_stores.csv', index=False)
+products.to_csv('dim_products.csv', index=False)
+customers.to_csv('dim_customers.csv', index=False)
+sales_fact.to_csv('fact_sales.csv', index=False)
 
 print("\n" + "="*60)
 print("Files saved to outputs directory")
