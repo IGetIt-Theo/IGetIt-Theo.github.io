@@ -3,32 +3,26 @@ location_summary.py
 --------------------
 Converts a Google Maps Timeline JSON into a daily location dwell summary CSV.
 
-Handles both data sources in the JSON:
-
-  semanticSegments  — Google's pre-processed visits (older data).
-                      Visit start/end times are already computed.
-                      Uses placeId lookup for business names where available,
-                      falls back to reverse geocoding the placeLocation lat/lng.
-
-  rawSignals        — Fine-grained sensor fixes (recent data).
-                      Stationary fixes are clustered, moving fixes serve as
-                      visit terminators to correctly bound dwell times.
-                      Cluster centroids are reverse geocoded.
-
-Both sources produce the same visit schema and are merged before aggregation.
+Pipeline:
+  1. Parse position + activity records from timeline.json
+  2. Drop records where the phone is moving (speed above threshold)
+  3. Cluster stationary fixes within a radius using a greedy centroid algorithm
+  4. Compute dwell time per cluster per day (gap-filled, capped at MAX_GAP_MINUTES)
+  5. Geocode cluster centroids via Google Maps Geocoding API (one call per cluster)
+  6. Write location_summary.csv
 
 Usage:
     python location_summary.py timeline.json --api-key YOUR_GOOGLE_API_KEY
 
-    # Dry run (no geocoding, coordinates used as names):
+    # Dry run (no geocoding, uses coordinates as name):
     python location_summary.py timeline.json
 
 Options:
-    --api-key       Google Maps Geocoding / Places API key
-    --radius        rawSignals cluster radius in meters (default: 100)
-    --max-speed     Max speed m/s considered stationary in rawSignals (default: 1.5)
-    --min-dwell     Min minutes a visit must last to be included (default: 10)
-    --utc-offset    Local UTC offset hours, e.g. -8 for PST (default: -8)
+    --api-key       Google Maps Geocoding API key
+    --radius        Clustering radius in meters (default: 100)
+    --max-speed     Max speed m/s to be considered stationary (default: 0.5)
+    --max-gap       Max minutes between fixes to count as continuous dwell (default: 30)
+    --min-dwell     Min minutes a cluster must be visited in a day to be included (default: 10)
 """
 
 import json
@@ -43,24 +37,19 @@ from datetime import datetime, timezone, timedelta
 from collections import defaultdict
 
 
-# ── Defaults ──────────────────────────────────────────────────────────────────
+# ── Constants ─────────────────────────────────────────────────────────────────
 
-DEFAULT_RADIUS_M   = 100
-DEFAULT_MAX_SPEED  = 1.5
-DEFAULT_MIN_DWELL  = 10
-DEFAULT_UTC_OFFSET = -8
+DEFAULT_RADIUS_M    = 100    # meters — adjust to taste (100–300 is reasonable)
+DEFAULT_MAX_SPEED   = 0.25    # m/s — anything above this is "moving"
+DEFAULT_MAX_GAP_MIN = 30     # minutes — gap larger than this breaks dwell continuity
+DEFAULT_MIN_DWELL   = 44     # minutes — clusters with less dwell are filtered out
+API_KEY = 'place your own api key here'
+FILE_LOCATION = 'download your location data here'
 
-
-# ── Shared helpers ────────────────────────────────────────────────────────────
+# ── Parsing ───────────────────────────────────────────────────────────────────
 
 def parse_latlng(raw: str):
-    """
-    Handle both clean degrees and the double-encoded UTF-8 seen in the data.
-    '37.2970009\u00c2\u00b0, -121.8868181\u00c2\u00b0' → (37.2970009, -121.8868181)
-    '37.2961758°, -121.9051795°'                        → (37.2961758, -121.9051795)
-    """
-    # \u00c2\u00b0 is the double-encoded form of the degree symbol °
-    cleaned = raw.replace("\u00c2\u00b0", "").replace("\u00b0", "").replace("°", "").strip()
+    cleaned = raw.replace("°", "").strip()
     parts = [p.strip() for p in cleaned.split(",")]
     if len(parts) == 2:
         try:
@@ -71,292 +60,163 @@ def parse_latlng(raw: str):
 
 
 def parse_timestamp(ts_str: str):
-    if not ts_str:
+    """Parse ISO 8601 timestamp with timezone offset to UTC datetime."""
+    if ts_str is None:
         return None
+    # Python 3.7+ handles offset-aware ISO 8601 via fromisoformat
+    # But the '°' stripping may leave trailing Z or offsets like -08:00
+    ts_str = ts_str.strip()
     try:
-        return datetime.fromisoformat(ts_str.strip()).astimezone(timezone.utc)
+        dt = datetime.fromisoformat(ts_str)
+        return dt.astimezone(timezone.utc)
     except Exception:
         return None
 
 
-def haversine_m(lat1, lng1, lat2, lng2):
-    R = 6_371_000
-    phi1, phi2 = math.radians(lat1), math.radians(lat2)
-    dphi    = math.radians(lat2 - lat1)
-    dlambda = math.radians(lng2 - lng1)
-    a = (math.sin(dphi / 2) ** 2
-         + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2)
-    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
-
-
-# ── Source 1: semanticSegments ────────────────────────────────────────────────
-
-def parse_semantic_visits(segments: list):
+def load_positions(json_path: Path, max_speed: float):
     """
-    Extract visit records from semanticSegments.
-    Only processes segments that have a 'visit' key.
-    timelinePath, activity, and timelineMemory segments are ignored.
-
-    Returns list of:
-      {start, end, lat, lng, place_id, source='semantic'}
+    Returns list of dicts: {timestamp (UTC datetime), lat, lng}
+    Filtered to stationary points only.
     """
-    visits = []
-    skipped = 0
+    with open(json_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
 
-    for seg in segments:
-        if "visit" not in seg:
-            skipped += 1
-            continue
+    if isinstance(data, list):
+        records = data
+    elif isinstance(data, dict):
+        for key in ("rawSignals", "locations", "timelineObjects", "records"):
+            if key in data:
+                records = data[key]
+                break
+        else:
+            records = []
+            for v in data.values():
+                if isinstance(v, list):
+                    records.extend(v)
+    else:
+        raise ValueError("Unexpected JSON structure.")
 
-        start = parse_timestamp(seg.get("startTime"))
-        end   = parse_timestamp(seg.get("endTime"))
-        if not start or not end:
-            continue
-
-        v       = seg["visit"]
-        cand    = v.get("topCandidate", {})
-        place_id = cand.get("placeId")
-
-        # placeLocation may be nested under topCandidate
-        loc = cand.get("placeLocation", {})
-        raw_latlng = loc.get("latLng", "")
-        lat, lng = parse_latlng(raw_latlng) if raw_latlng else (None, None)
-
-        visits.append({
-            "start":    start,
-            "end":      end,
-            "lat":      lat,
-            "lng":      lng,
-            "place_id": place_id,
-            "source":   "semantic",
-        })
-
-    print(f"  semanticSegments: {len(visits):,} visit segments"
-          f"  ({skipped:,} non-visit segments skipped)")
-    return visits
-
-
-# ── Source 2: rawSignals ──────────────────────────────────────────────────────
-
-def load_raw_positions(raw_signals: list, max_speed: float):
     positions = []
-    for rec in raw_signals:
+    for rec in records:
         if "position" not in rec:
             continue
         p = rec["position"]
+        speed = p.get("speedMetersPerSecond")
+        # Exclude points where speed is known and above threshold
+        if speed is not None and speed > max_speed:
+            continue
         lat, lng = parse_latlng(p.get("LatLng", ""))
         if lat is None:
             continue
         ts = parse_timestamp(p.get("timestamp"))
         if ts is None:
             continue
-        speed = p.get("speedMetersPerSecond")
-        is_moving = (speed is not None and speed > max_speed)
-        positions.append({"ts": ts, "lat": lat, "lng": lng, "moving": is_moving})
+        positions.append({"ts": ts, "lat": lat, "lng": lng})
 
     positions.sort(key=lambda x: x["ts"])
-    stationary = sum(1 for p in positions if not p["moving"])
-    moving     = len(positions) - stationary
-    print(f"  rawSignals: {len(positions):,} fixes  "
-          f"({stationary:,} stationary, {moving:,} moving)")
+    print(f"  Loaded {len(positions):,} stationary position fixes")
     return positions
 
 
-def build_clusters(positions: list, radius_m: float):
-    clusters = []
-    cid_map  = {}
+# ── Clustering ────────────────────────────────────────────────────────────────
 
-    for i, pos in enumerate(positions):
-        if pos["moving"]:
-            cid_map[i] = None
-            continue
+def haversine_m(lat1, lng1, lat2, lng2):
+    """Distance in meters between two lat/lng points."""
+    R = 6_371_000
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlambda = math.radians(lng2 - lng1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
+    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
-        best_cid, best_dist = None, float("inf")
-        for cid, c in enumerate(clusters):
+
+def cluster_positions(positions: list, radius_m: float):
+    """
+    Greedy centroid clustering.
+    Each position is assigned to the nearest existing cluster within radius_m.
+    If none found, a new cluster is created.
+    Returns list of cluster dicts with centroid lat/lng and list of member positions.
+    """
+    clusters = []  # each: {lat, lng, points: [...]}
+
+    for pos in positions:
+        best_cluster = None
+        best_dist = float("inf")
+
+        for c in clusters:
             d = haversine_m(pos["lat"], pos["lng"], c["lat"], c["lng"])
             if d < radius_m and d < best_dist:
-                best_dist, best_cid = d, cid
+                best_dist = d
+                best_cluster = c
 
-        if best_cid is None:
-            best_cid = len(clusters)
-            clusters.append({"lat": pos["lat"], "lng": pos["lng"], "count": 1})
+        if best_cluster is None:
+            clusters.append({"lat": pos["lat"], "lng": pos["lng"], "points": [pos]})
         else:
-            c = clusters[best_cid]
-            c["count"] += 1
-            c["lat"] += (pos["lat"] - c["lat"]) / c["count"]
-            c["lng"] += (pos["lng"] - c["lng"]) / c["count"]
+            best_cluster["points"].append(pos)
+            # Update centroid (running mean)
+            n = len(best_cluster["points"])
+            best_cluster["lat"] = sum(p["lat"] for p in best_cluster["points"]) / n
+            best_cluster["lng"] = sum(p["lng"] for p in best_cluster["points"]) / n
 
-        cid_map[i] = best_cid
-
-    print(f"  rawSignals: {len(clusters):,} clusters (radius={radius_m}m)")
-    return clusters, cid_map
+    print(f"  Found {len(clusters):,} unique location clusters (radius={radius_m}m)")
+    return clusters
 
 
-def detect_raw_visits(positions: list, cid_map: dict, clusters: list):
+# ── Dwell time calculation ────────────────────────────────────────────────────
+
+def compute_daily_dwell(clusters: list, max_gap_min: int, min_dwell_min: int, local_offset_hours: int = -8):
     """
-    Walk the full rawSignals timeline. Moving fixes terminate visits correctly.
-    Returns list of {start, end, lat, lng, place_id=None, source='raw'}.
+    For each cluster, compute dwell minutes per local calendar day.
+    Gaps between consecutive fixes larger than max_gap_min are capped at max_gap_min
+    to avoid inflating dwell during overnight stays where tracking stopped.
+
+    Returns list of {date, cluster_id, lat, lng, dwell_minutes}.
     """
-    visits = []
-    n = len(positions)
-    i = 0
-
-    while i < n:
-        cid = cid_map.get(i)
-        if cid is None:
-            i += 1
-            continue
-
-        visit_start = positions[i]["ts"]
-        j = i + 1
-        while j < n and cid_map.get(j) == cid:
-            j += 1
-
-        visit_end = positions[j]["ts"] if j < n else positions[j - 1]["ts"]
-
-        visits.append({
-            "start":    visit_start,
-            "end":      visit_end,
-            "lat":      clusters[cid]["lat"],
-            "lng":      clusters[cid]["lng"],
-            "place_id": None,
-            "source":   "raw",
-            "cluster_id": cid,
-        })
-        i = j
-
-    print(f"  rawSignals: {len(visits):,} raw visits detected")
-    return visits
-
-
-# ── Merge & deduplicate ───────────────────────────────────────────────────────
-
-def merge_visits(semantic_visits: list, raw_visits: list):
-    """
-    Combine both visit lists.
-    If a semantic visit overlaps with a raw visit at the same location,
-    prefer the semantic one (it has placeId and cleaner times).
-    Simple approach: drop raw visits whose time range overlaps a semantic visit.
-    """
-    if not semantic_visits:
-        return raw_visits
-    if not raw_visits:
-        return semantic_visits
-
-    # Build semantic time windows for overlap checking
-    sem_windows = [(v["start"], v["end"]) for v in semantic_visits]
-
-    def overlaps_semantic(raw_v):
-        for s, e in sem_windows:
-            # Overlap if not (raw ends before sem starts, or raw starts after sem ends)
-            if not (raw_v["end"] <= s or raw_v["start"] >= e):
-                return True
-        return False
-
-    filtered_raw = [v for v in raw_visits if not overlaps_semantic(v)]
-    dropped = len(raw_visits) - len(filtered_raw)
-    if dropped:
-        print(f"  Dedup: dropped {dropped:,} raw visits overlapping semantic visits")
-
-    merged = semantic_visits + filtered_raw
-    merged.sort(key=lambda x: x["start"])
-    print(f"  Merged total: {len(merged):,} visits")
-    return merged
-
-
-# ── Daily aggregation ─────────────────────────────────────────────────────────
-
-def aggregate_by_day(visits: list, min_dwell_min: int, utc_offset_hours: int):
-    """
-    Sum visit durations by (lat, lng, place_id, local day).
-    Visits crossing midnight are split across both days.
-    Returns rows keyed by a location fingerprint for geocoding.
-    """
-    local_offset = timedelta(hours=utc_offset_hours)
-
-    # daily: (fingerprint, date_str) -> {minutes, lat, lng, place_id}
-    daily = defaultdict(lambda: {"minutes": 0.0, "lat": None, "lng": None, "place_id": None})
-
-    for v in visits:
-        duration_min = (v["end"] - v["start"]).total_seconds() / 60
-        if duration_min <= 0:
-            continue
-
-        # Fingerprint: cluster by place_id if available, else by rounded coords
-        if v.get("place_id"):
-            fingerprint = ("pid", v["place_id"])
-        else:
-            fp_lat = round(v["lat"] or 0, 4)
-            fp_lng = round(v["lng"] or 0, 4)
-            fingerprint = ("ll", fp_lat, fp_lng)
-
-        local_start = v["start"] + local_offset
-        local_end   = v["end"]   + local_offset
-
-        current = local_start
-        while True:
-            day_str    = current.strftime("%Y-%m-%d")
-            end_of_day = current.replace(hour=23, minute=59, second=59, microsecond=999999)
-            seg_end    = min(local_end, end_of_day)
-            seg_min    = (seg_end - current).total_seconds() / 60
-
-            if seg_min > 0:
-                key = (fingerprint, day_str)
-                daily[key]["minutes"]  += seg_min
-                daily[key]["lat"]       = v["lat"]
-                daily[key]["lng"]       = v["lng"]
-                daily[key]["place_id"]  = v.get("place_id")
-
-            if local_end <= end_of_day:
-                break
-            current = (end_of_day + timedelta(seconds=1)).replace(
-                hour=0, minute=0, second=0, microsecond=0
-            )
-
+    max_gap = timedelta(minutes=max_gap_min)
+    local_offset = timedelta(hours=local_offset_hours)
     rows = []
-    for (fingerprint, date_str), info in daily.items():
-        if info["minutes"] >= min_dwell_min:
-            rows.append({
-                "date":          date_str,
-                "fingerprint":   fingerprint,
-                "lat":           info["lat"],
-                "lng":           info["lng"],
-                "place_id":      info["place_id"],
-                "dwell_minutes": round(info["minutes"]),
-            })
+
+    for cid, cluster in enumerate(clusters):
+        points = sorted(cluster["points"], key=lambda x: x["ts"])
+        if len(points) < 2:
+            continue
+
+        # Group consecutive points; accumulate dwell by local date
+        daily = defaultdict(float)  # date_str -> minutes
+
+        for i in range(1, len(points)):
+            prev = points[i - 1]
+            curr = points[i]
+            gap = curr["ts"] - prev["ts"]
+
+            # Use the midpoint's local date as the "day" this dwell belongs to
+            mid_utc = prev["ts"] + gap / 2
+            local_day = (mid_utc + local_offset).strftime("%Y-%m-%d")
+
+            dwell = min(gap, max_gap)
+            daily[local_day] += dwell.total_seconds() / 60
+
+        for date_str, minutes in daily.items():
+            if minutes >= min_dwell_min:
+                rows.append({
+                    "date":         date_str,
+                    "cluster_id":   cid,
+                    "lat":          round(cluster["lat"], 7),
+                    "lng":          round(cluster["lng"], 7),
+                    "dwell_minutes": round(minutes),
+                })
 
     rows.sort(key=lambda x: (x["date"], -x["dwell_minutes"]))
-    print(f"  {len(rows):,} location-day rows (min_dwell={min_dwell_min}m)")
     return rows
 
 
 # ── Geocoding ─────────────────────────────────────────────────────────────────
 
-def lookup_place_id(place_id: str, api_key: str):
-    """Places API — returns display name for a placeId."""
-    url = (
-        f"https://maps.googleapis.com/maps/api/place/details/json"
-        f"?place_id={urllib.parse.quote(place_id)}"
-        f"&fields=name,formatted_address"
-        f"&key={api_key}"
-    )
-    try:
-        with urllib.request.urlopen(url, timeout=10) as resp:
-            data = json.loads(resp.read().decode())
-    except Exception as e:
-        return None, f"[error: {e}]"
-
-    if data.get("status") != "OK":
-        return None, f"[status: {data.get('status')}]"
-
-    result = data.get("result", {})
-    name    = result.get("name")
-    address = result.get("formatted_address", "")
-    return name, address
-
-
-def reverse_geocode(lat: float, lng: float, api_key: str):
-    """Geocoding API — returns best name for a lat/lng."""
+def geocode_cluster(lat: float, lng: float, api_key: str):
+    """
+    Reverse geocode a lat/lng via Google Maps Geocoding API.
+    Returns a human-readable name: establishment > point_of_interest > street address.
+    """
     url = (
         f"https://maps.googleapis.com/maps/api/geocode/json"
         f"?latlng={lat},{lng}&key={api_key}"
@@ -365,87 +225,66 @@ def reverse_geocode(lat: float, lng: float, api_key: str):
         with urllib.request.urlopen(url, timeout=10) as resp:
             data = json.loads(resp.read().decode())
     except Exception as e:
-        return f"{lat:.5f}, {lng:.5f}  [error: {e}]"
+        return f"{lat}, {lng}  [geocode error: {e}]"
 
     if data.get("status") != "OK":
-        return f"{lat:.5f}, {lng:.5f}  [status: {data.get('status')}]"
+        return f"{lat}, {lng}  [status: {data.get('status')}]"
 
     results = data.get("results", [])
     if not results:
-        return f"{lat:.5f}, {lng:.5f}"
+        return f"{lat}, {lng}"
 
-    for preferred in ("establishment", "point_of_interest", "premise"):
+    # Prefer named places (establishments, POIs) over street addresses
+    for preferred_type in ("establishment", "point_of_interest", "premise"):
         for r in results:
-            if preferred in r.get("types", []):
+            if preferred_type in r.get("types", []):
                 return r["formatted_address"]
 
+    # Fall back to first result (usually a street address)
     return results[0]["formatted_address"]
 
 
-def resolve_location_names(rows: list, api_key: str):
-    """
-    Geocode each unique fingerprint once.
-    placeId  → Places API (name + address, e.g. "Forma Gym")
-    lat/lng  → Geocoding API (address)
-    No API key → coordinates as name.
-
-    Returns dict: fingerprint -> display name
-    """
-    unique = {}
-    for row in rows:
-        fp = row["fingerprint"]
-        if fp not in unique:
-            unique[fp] = {"lat": row["lat"], "lng": row["lng"], "place_id": row["place_id"]}
-
-    names  = {}
-    total  = len(unique)
-    print(f"  Resolving {total} unique locations ...")
-
-    for i, (fp, info) in enumerate(unique.items()):
-        if not api_key:
-            lat, lng = info["lat"] or 0, info["lng"] or 0
-            names[fp] = f"{lat:.5f}, {lng:.5f}"
-            continue
-
-        pid = info.get("place_id")
-        if pid:
-            name, address = lookup_place_id(pid, api_key)
-            if name:
-                display = f"{name}, {address}" if address else name
-            else:
-                # placeId lookup failed — fall back to reverse geocode
-                lat, lng = info["lat"] or 0, info["lng"] or 0
-                display  = reverse_geocode(lat, lng, api_key)
-        else:
-            lat, lng = info["lat"] or 0, info["lng"] or 0
-            display  = reverse_geocode(lat, lng, api_key)
-
-        names[fp] = display
-        print(f"  [{i+1}/{total}] {display[:72]}")
-
+def geocode_all_clusters(clusters: list, api_key: str):
+    """Returns dict: cluster_id -> location name."""
+    names = {}
+    total = len(clusters)
+    for cid, cluster in enumerate(clusters):
+        name = geocode_cluster(cluster["lat"], cluster["lng"], api_key)
+        names[cid] = name
+        # Simple progress indicator
+        print(f"  Geocoded {cid + 1}/{total}: {name[:60]}")
     return names
 
 
 # ── Output ────────────────────────────────────────────────────────────────────
 
-def write_summary(rows: list, location_names: dict, out_path: Path):
+def format_duration(minutes: int):
+    h = minutes // 60
+    m = minutes % 60
+    if h > 0 and m > 0:
+        return f"{h}h {m}m"
+    elif h > 0:
+        return f"{h}h"
+    else:
+        return f"{m}m"
+
+
+def write_summary(rows: list, cluster_names: dict, out_path: Path):
     with open(out_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
-        writer.writerow(["date", "location", "dwell_hours", "dwell_minutes",
-                          "latitude", "longitude", "place_id"])
+        writer.writerow(["date", "location", "dwell_hours", "dwell_minutes", "latitude", "longitude"])
         for row in rows:
-            fp   = row["fingerprint"]
-            name = location_names.get(fp, str(fp))
-            mins = row["dwell_minutes"]
-            hrs  = round(mins / 60, 2)
+            cid = row["cluster_id"]
+            name = cluster_names.get(cid, f"{row['lat']}, {row['lng']}")
+            dwell_min = row["dwell_minutes"]
+            dwell_hrs = round(dwell_min / 60, 2)
             writer.writerow([
                 row["date"],
                 name,
-                hrs,
-                mins,
-                round(row["lat"], 6) if row["lat"] else "",
-                round(row["lng"], 6) if row["lng"] else "",
-                row["place_id"] or "",
+                dwell_hrs,
+                dwell_min,
+                row["lat"],
+                row["lng"],
             ])
     print(f"\n  ✓ {out_path.name}  ({len(rows):,} rows)")
 
@@ -453,15 +292,14 @@ def write_summary(rows: list, location_names: dict, out_path: Path):
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Google Timeline → daily location dwell summary"
-    )
-    parser.add_argument("json_file",                                           help="Path to timeline.json")
-    parser.add_argument("--api-key",    default=None,                          help="Google Maps API key (Geocoding + Places)")
-    parser.add_argument("--radius",     type=float, default=DEFAULT_RADIUS_M,  help=f"rawSignals cluster radius meters (default {DEFAULT_RADIUS_M})")
-    parser.add_argument("--max-speed",  type=float, default=DEFAULT_MAX_SPEED, help=f"Max stationary speed m/s (default {DEFAULT_MAX_SPEED})")
-    parser.add_argument("--min-dwell",  type=int,   default=DEFAULT_MIN_DWELL, help=f"Min dwell minutes to include (default {DEFAULT_MIN_DWELL})")
-    parser.add_argument("--utc-offset", type=int,   default=DEFAULT_UTC_OFFSET,help=f"Local UTC offset hours (default {DEFAULT_UTC_OFFSET})")
+    parser = argparse.ArgumentParser(description="Google Timeline → daily location summary")
+    parser.add_argument("json_file",            type=str,   default=FILE_LOCATION,      help="Path to timeline.json")
+    parser.add_argument("--api-key",            type=str,   default=API_KEY,             help="Google Geocoding API key")
+    parser.add_argument("--radius",             type=float, default=DEFAULT_RADIUS_M,    help="Cluster radius in meters")
+    parser.add_argument("--max-speed",          type=float, default=DEFAULT_MAX_SPEED,   help="Max stationary speed m/s")
+    parser.add_argument("--max-gap",            type=int,   default=DEFAULT_MAX_GAP_MIN, help="Max gap minutes for dwell continuity")
+    parser.add_argument("--min-dwell",          type=int,   default=DEFAULT_MIN_DWELL,   help="Min dwell minutes to include a visit")
+    parser.add_argument("--utc-offset",         type=int,   default=-8,                  help="Local UTC offset hours (e.g. -8 for PST)")
     args = parser.parse_args()
 
     json_path = Path(args.json_file)
@@ -469,58 +307,41 @@ def main():
         print(f"File not found: {json_path}")
         sys.exit(1)
 
-    with open(json_path, "r", encoding="utf-8") as f:
-        data = json.load(f)
+    print(f"\n── Parsing {json_path.name} ──────────────────────────────")
+    positions = load_positions(json_path, args.max_speed)
 
-    # Normalise: file may be a bare list (rawSignals only) or the full dict
-    if isinstance(data, list):
-        raw_signals      = data
-        semantic_segs    = []
+    print(f"\n── Clustering (radius={args.radius}m) ────────────────────")
+    clusters = cluster_positions(positions, args.radius)
+
+    print(f"\n── Computing daily dwell times {args.min_dwell} ───────────────────────────")
+    rows = compute_daily_dwell(clusters, args.max_gap, args.min_dwell, args.utc_offset)
+    print(f"  {len(rows):,} location-day rows before geocoding")
+
+    if args.api_key:
+        print(f"\n── Geocoding {len(clusters)} cluster centroids ─────────────")
+        # Only geocode clusters that appear in our output rows
+        active_cids = {r["cluster_id"] for r in rows}
+        active_clusters = {cid: clusters[cid] for cid in active_cids}
+        cluster_names = {}
+        total = len(active_clusters)
+        for i, (cid, cluster) in enumerate(active_clusters.items()):
+            name = geocode_cluster(cluster["lat"], cluster["lng"], args.api_key)
+            cluster_names[cid] = name
+            print(f"  [{i+1}/{total}] {name[:70]}")
     else:
-        raw_signals      = data.get("rawSignals", [])
-        semantic_segs    = data.get("semanticSegments", [])
+        print(f"\n── No API key provided — using coordinates as location names ──")
+        cluster_names = {
+            cid: f"{clusters[cid]['lat']}, {clusters[cid]['lng']}"
+            for cid in range(len(clusters))
+        }
 
-    all_visits = []
-
-    # ── semanticSegments ──────────────────────────────────────────────────────
-    if semantic_segs:
-        print(f"\n── semanticSegments ({len(semantic_segs):,} total) ──────────────────")
-        sem_visits = parse_semantic_visits(semantic_segs)
-        all_visits.extend(sem_visits)
-
-    # ── rawSignals ────────────────────────────────────────────────────────────
-    if raw_signals:
-        print(f"\n── rawSignals ({len(raw_signals):,} records) ────────────────────────")
-        positions          = load_raw_positions(raw_signals, args.max_speed)
-        clusters, cid_map  = build_clusters(positions, args.radius)
-        raw_visits         = detect_raw_visits(positions, cid_map, clusters)
-        all_visits.extend(raw_visits)
-
-    # ── Merge ─────────────────────────────────────────────────────────────────
-    print(f"\n── Merging sources ──────────────────────────────────────────────")
-    merged = merge_visits(
-        [v for v in all_visits if v["source"] == "semantic"],
-        [v for v in all_visits if v["source"] == "raw"],
-    )
-
-    # ── Aggregate ─────────────────────────────────────────────────────────────
-    print(f"\n── Aggregating by day ───────────────────────────────────────────")
-    rows = aggregate_by_day(merged, args.min_dwell, args.utc_offset)
-
-    # ── Geocode ───────────────────────────────────────────────────────────────
-    print(f"\n── Resolving location names ─────────────────────────────────────")
-    location_names = resolve_location_names(rows, args.api_key)
-
-    # ── Write ─────────────────────────────────────────────────────────────────
-    print(f"\n── Writing output ───────────────────────────────────────────────")
+    print(f"\n── Writing output ────────────────────────────────────────")
     out_path = json_path.parent / "location_summary.csv"
-    write_summary(rows, location_names, out_path)
+    write_summary(rows, cluster_names, out_path)
 
-    print("\nTips for Power BI:")
-    print("  • Set 'date' column type → Date")
-    print("  • 'latitude' + 'longitude' enable Map visuals")
-    print("  • Rename locations directly in the CSV before importing")
-    print("  • PST is -8, PDT is -7 — adjust --utc-offset if data spans DST\n")
+    print("\nTip: In Power BI, set 'date' as Date type.")
+    print("     'latitude'/'longitude' columns enable Map visuals.")
+    print("     You can rename locations in the CSV before loading.")
 
 
 if __name__ == "__main__":
