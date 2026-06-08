@@ -27,6 +27,8 @@ stores = pd.DataFrame({
 store_weights = np.array([0.50, 0.15, 0.10, 0.08, 0.06, 0.05, 0.03, 0.02, 0.01, 0.005])
 store_weights = store_weights / store_weights.sum()  # Normalize
 
+store_weights_norm = (store_weights - np.min(store_weights)) / (np.max(store_weights)-np.min(store_weights))
+
 # DIMENSION: Products
 categories = ['Flower', 'Vape', 'Pre-roll', 'Edibles', 'Wellness']
 # Number of products per category (Flower and Pre-roll get more variety)
@@ -66,7 +68,7 @@ for category in categories:
 products = pd.DataFrame(products_list)
 
 # DIMENSION: Customers with realistic age/gender distribution
-num_customers = 15000
+num_customers = 25000
 
 # Gender: 68% Male, 32% Female (industry average)
 genders = np.random.choice(['Male', 'Female'], num_customers, p=[0.68, 0.32])
