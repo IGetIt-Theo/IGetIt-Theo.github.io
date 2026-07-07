@@ -1,0 +1,6 @@
+# Everything except what the container needs.
+*
+!Dockerfile
+!requirements.txt
+!cannabis_common.py
+!cannabis_nightly.py

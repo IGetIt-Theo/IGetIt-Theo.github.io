@@ -1,0 +1,5 @@
+pandas>=2.0
+numpy>=1.24
+pandas-gbq>=0.22
+google-cloud-bigquery>=3.20
+db-dtypes>=1.2

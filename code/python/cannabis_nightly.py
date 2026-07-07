@@ -31,10 +31,70 @@ import numpy as np
 import pandas as pd
 from datetime import date, datetime, timedelta
 
-import pandas_gbq
 from google.cloud import bigquery
 
 import cannabis_common as cc
+
+
+# ── Explicit BigQuery schemas (match cannabis_initial_load.py) ───────────────
+# Pinning column types — especially DATE/DATETIME — prevents the date-mangling
+# that object-dtype columns caused with inferred uploads.
+def _schemas():
+    bq = bigquery
+    return {
+        cc.TBL_DIM_DATE: [
+            bq.SchemaField('date', 'DATE', mode='REQUIRED'),
+            bq.SchemaField('year', 'INT64'),
+            bq.SchemaField('quarter', 'INT64'),
+            bq.SchemaField('month', 'INT64'),
+            bq.SchemaField('month_name', 'STRING'),
+            bq.SchemaField('day', 'INT64'),
+            bq.SchemaField('day_of_week', 'INT64'),
+            bq.SchemaField('day_name', 'STRING'),
+            bq.SchemaField('is_weekend', 'BOOL'),
+        ],
+        cc.TBL_DIM_CUSTOMER: [
+            bq.SchemaField('customer_id', 'INT64', mode='REQUIRED'),
+            bq.SchemaField('gender', 'STRING'),
+            bq.SchemaField('generation', 'STRING'),
+            bq.SchemaField('segment', 'STRING'),
+            bq.SchemaField('home_store_id', 'INT64'),
+            bq.SchemaField('total_visits', 'INT64'),
+            bq.SchemaField('first_visit_date', 'DATE'),
+            bq.SchemaField('last_visit_date', 'DATE'),
+        ],
+        cc.TBL_FACT_SALES: [
+            bq.SchemaField('transaction_id', 'INT64', mode='REQUIRED'),
+            bq.SchemaField('line_id', 'INT64', mode='REQUIRED'),
+            bq.SchemaField('date', 'DATE', mode='REQUIRED'),
+            bq.SchemaField('datetime', 'DATETIME', mode='REQUIRED'),
+            bq.SchemaField('store_id', 'INT64', mode='REQUIRED'),
+            bq.SchemaField('customer_id', 'INT64', mode='REQUIRED'),
+            bq.SchemaField('product_id', 'INT64', mode='REQUIRED'),
+            bq.SchemaField('quantity', 'INT64'),
+            bq.SchemaField('unit_price', 'FLOAT64'),
+            bq.SchemaField('unit_cost', 'FLOAT64'),
+            bq.SchemaField('discount', 'FLOAT64'),
+            bq.SchemaField('line_total', 'FLOAT64'),
+            bq.SchemaField('line_cost', 'FLOAT64'),
+        ],
+    }
+
+
+def _append_df(client, table_name, df):
+    """Append a dataframe to a BigQuery table with an explicit schema, then
+    verify the table grew by exactly len(df) rows. Raises on mismatch."""
+    table_id = f"{cc.BQ_PROJECT}.{cc.BQ_DATASET}.{table_name}"
+    before = list(client.query(f"SELECT COUNT(*) AS n FROM `{table_id}`").result())[0]['n']
+    job_config = bigquery.LoadJobConfig(
+        schema=_schemas()[table_name],
+        write_disposition='WRITE_APPEND',
+    )
+    client.load_table_from_dataframe(df, table_id, job_config=job_config).result()
+    after = list(client.query(f"SELECT COUNT(*) AS n FROM `{table_id}`").result())[0]['n']
+    if after - before != len(df):
+        raise SystemExit(
+            f"Append mismatch on {table_name}: expected +{len(df)}, got +{after - before}")
 
 # ── New-customer arrival rate ───────────────────────────────────────────────
 # The initial pool was 15,000 customers over ~365 days. To keep the roster
@@ -97,7 +157,7 @@ def date_exists(client, target: date) -> bool:
 
 
 def build_dim_date_row(target: date) -> pd.DataFrame:
-    return pd.DataFrame([{
+    df = pd.DataFrame([{
         'date':        target,
         'year':        target.year,
         'quarter':     (target.month - 1) // 3 + 1,
@@ -108,6 +168,8 @@ def build_dim_date_row(target: date) -> pd.DataFrame:
         'day_name':    target.strftime('%A'),
         'is_weekend':  target.weekday() >= 5,
     }])
+    df['date'] = pd.to_datetime(df['date'])
+    return df
 
 
 def generate_day(roster: pd.DataFrame, catalog_by_cat: dict, target: date,
@@ -182,31 +244,41 @@ def generate_day(roster: pd.DataFrame, catalog_by_cat: dict, target: date,
 
 def apply_state_updates(client, visited_existing: dict, new_cust_df: pd.DataFrame, target: date):
     """Append new customers and update visit counters for returners via MERGE."""
-    dest = lambda t: f"{cc.BQ_DATASET}.{t}"
-
-    # New customers: straight append
+    # New customers: append with explicit schema + verification
     if not new_cust_df.empty:
-        pandas_gbq.to_gbq(new_cust_df, dest(cc.TBL_DIM_CUSTOMER),
-                          project_id=cc.BQ_PROJECT, if_exists='append')
+        nc = new_cust_df.copy()
+        nc['first_visit_date'] = pd.to_datetime(nc['first_visit_date'])
+        nc['last_visit_date']  = pd.to_datetime(nc['last_visit_date'])
+        _append_df(client, cc.TBL_DIM_CUSTOMER, nc)
 
-    # Returners: update total_visits + last_visit_date with a parameterized MERGE
+    # Returners: update total_visits + last_visit_date via a staging table + MERGE
     if visited_existing:
         updates = pd.DataFrame([
             {'customer_id': cid, 'total_visits': tv, 'last_visit_date': ld}
             for cid, (tv, ld) in visited_existing.items()
         ])
-        staging = f"{cc.BQ_DATASET}._stg_visit_updates"
-        pandas_gbq.to_gbq(updates, staging, project_id=cc.BQ_PROJECT, if_exists='replace')
+        updates['last_visit_date'] = pd.to_datetime(updates['last_visit_date'])
+        staging_id = f"{cc.BQ_PROJECT}.{cc.BQ_DATASET}._stg_visit_updates"
+        stg_schema = [
+            bigquery.SchemaField('customer_id', 'INT64', mode='REQUIRED'),
+            bigquery.SchemaField('total_visits', 'INT64'),
+            bigquery.SchemaField('last_visit_date', 'DATE'),
+        ]
+        client.load_table_from_dataframe(
+            updates, staging_id,
+            job_config=bigquery.LoadJobConfig(
+                schema=stg_schema, write_disposition='WRITE_TRUNCATE'),
+        ).result()
         merge = f"""
             MERGE `{cc.BQ_PROJECT}.{cc.BQ_DATASET}.{cc.TBL_DIM_CUSTOMER}` T
-            USING `{cc.BQ_PROJECT}.{staging}` S
+            USING `{staging_id}` S
             ON T.customer_id = S.customer_id
             WHEN MATCHED THEN UPDATE SET
               T.total_visits    = S.total_visits,
               T.last_visit_date = S.last_visit_date
         """
         client.query(merge).result()
-        client.query(f"DROP TABLE `{cc.BQ_PROJECT}.{staging}`").result()
+        client.query(f"DROP TABLE `{staging_id}`").result()
 
 
 def main():
@@ -233,14 +305,17 @@ def main():
         print("  no transactions generated; nothing to load.")
         return
 
-    # Append fact rows
-    pandas_gbq.to_gbq(fact_df, f"{cc.BQ_DATASET}.{cc.TBL_FACT_SALES}",
-                      project_id=cc.BQ_PROJECT, if_exists='append')
+    # Normalize date columns before upload (DATE/DATETIME pinned via schema)
+    fact_df = fact_df.copy()
+    fact_df['date']     = pd.to_datetime(fact_df['date'])
+    fact_df['datetime'] = pd.to_datetime(fact_df['datetime'])
+
+    # Append fact rows (verified)
+    _append_df(client, cc.TBL_FACT_SALES, fact_df)
 
     # Extend dim_date if needed
     if not date_exists(client, target):
-        pandas_gbq.to_gbq(build_dim_date_row(target), f"{cc.BQ_DATASET}.{cc.TBL_DIM_DATE}",
-                          project_id=cc.BQ_PROJECT, if_exists='append')
+        _append_df(client, cc.TBL_DIM_DATE, build_dim_date_row(target))
 
     # Update roster state
     apply_state_updates(client, visited_existing, new_cust_df, target)
