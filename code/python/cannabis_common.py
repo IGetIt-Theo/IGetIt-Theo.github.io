@@ -97,12 +97,18 @@ STORE_WEIGHTS /= STORE_WEIGHTS.sum()
 # ── Product catalog ─────────────────────────────────────────────────────────
 CATEGORIES = ['Flower', 'Vape', 'Pre-roll', 'Edibles', 'Wellness']
 
+# WHOLESALE COST ranges. Retail price = cost * uniform(1.4, 2.2).
+# Calibrated so the resulting RETAIL prices match industry benchmarks:
+#   Headset (Jun 2026): avg product sold $15.91, avg eighth of flower $20.64
+#   Flowhub (2025): walk-in AOV $50.56, 2.7 items/basket
+# The previous values were written as retail-ish prices and then marked up
+# again, producing a ~4x inflated catalog (mean sold item ~$62).
 CATEGORY_COST_RANGES = {
-    'Flower':    (15.00,  80.00),
-    'Vape':      (25.00,  60.00),
-    'Pre-roll':  ( 8.00,  25.00),
-    'Edibles':   (15.00,  45.00),
-    'Wellness':  (20.00, 100.00),
+    'Flower':    ( 7.00, 18.00),   # -> retail ~$10-40 (eighths, quarters)
+    'Vape':      ( 9.00, 22.00),   # -> retail ~$13-48 (carts, disposables)
+    'Pre-roll':  ( 2.20,  6.00),   # -> retail ~$3-13  (singles, infused)
+    'Edibles':   ( 4.00, 11.00),   # -> retail ~$6-24  (gummy packs, chocolate)
+    'Wellness':  ( 9.00, 24.00),   # -> retail ~$13-53 (tinctures, topicals)
 }
 
 PRODUCTS_PER_CATEGORY = {
@@ -197,8 +203,17 @@ CATEGORY_PREFERENCES = {
     'Boomer':     [0.40, 0.05, 0.15, 0.15, 0.25],
 }
 
-BASKET_SIZE = {
-    'Gen Z': (1, 3), 'Millennial': (1, 4), 'Gen X': (2, 4), 'Boomer': (1, 3),
+# Basket size as a weighted distribution over LINE COUNT, not a uniform range.
+# Real retail is right-skewed: most trips are 1-2 items, a minority are stock-up
+# trips of 5-6. A uniform (lo, hi) draw cannot produce that tail, which is why
+# the old model had no realistic big spenders.
+#   Benchmarks: ~2.7 items/basket (Flowhub 2025), mean AOV > median AOV.
+# Format: generation -> (line_counts, probabilities)
+BASKET_SIZE_DIST = {
+    'Gen Z':      ([1, 2, 3, 4, 5, 6], [0.34, 0.32, 0.19, 0.09, 0.04, 0.02]),
+    'Millennial': ([1, 2, 3, 4, 5, 6], [0.30, 0.31, 0.21, 0.11, 0.05, 0.02]),
+    'Gen X':      ([1, 2, 3, 4, 5, 6], [0.26, 0.30, 0.22, 0.13, 0.06, 0.03]),
+    'Boomer':     ([1, 2, 3, 4, 5, 6], [0.38, 0.32, 0.17, 0.08, 0.03, 0.02]),
 }
 
 VISIT_FREQUENCY = {
@@ -222,8 +237,9 @@ SEGMENT_MULTIPLIER = {
     'loyal':        1.1,
 }
 
+# Units of the SAME sku on one line. Buying 3 of one item is uncommon.
 QUANTITY_OPTIONS = [1, 2, 3]
-QUANTITY_WEIGHTS = [0.75, 0.20, 0.05]
+QUANTITY_WEIGHTS = [0.80, 0.15, 0.05]
 
 
 def annual_visits(gender: str, generation: str, segment: str) -> float:
@@ -264,8 +280,9 @@ def sample_store(home_store_id: int) -> int:
     return home_store_id
 
 def sample_basket_size(generation: str) -> int:
-    lo, hi = BASKET_SIZE[generation]
-    return int(np.random.randint(lo, hi + 1))
+    """Draw a line count from the generation's weighted basket distribution."""
+    counts, probs = BASKET_SIZE_DIST[generation]
+    return int(np.random.choice(counts, p=probs))
 
 def sample_category(generation: str) -> str:
     return str(np.random.choice(CATEGORIES, p=CATEGORY_PREFERENCES[generation]))
