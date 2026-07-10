@@ -29,9 +29,9 @@ from datetime import date, datetime, timedelta
 import cannabis_common as cc
  
 # ── Parameters ──────────────────────────────────────────────────────────────
-START_DATE         = date(2025, 6, 30)
+START_DATE         = date(2025, 7, 1)
 END_DATE           = date.today() - timedelta(days=1)   # always yesterday
-CUSTOMER_POOL_SIZE = 15000
+CUSTOMER_POOL_SIZE = 17000
 RANDOM_SEED        = None   # set an int for reproducibility
  
 if RANDOM_SEED is not None:
