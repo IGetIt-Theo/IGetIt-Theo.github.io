@@ -28,6 +28,15 @@
             border-left: 4px solid #3498db;
             padding-left: 20px;
             margin: 30px 0;
+            overflow: auto;
+        }
+
+        .project-image {
+            float: left;
+            width: 50%;
+            max-width: 400px;
+            margin: 0 20px 10px 0;
+            border-radius: 6px;
         }
 
         a {
@@ -66,34 +75,47 @@
         <img src="images/igetit.png" alt="IGetIt Logo" class="logo">
     </header>
 
+    <h2>Featured Projects</h2>
+
     <div class="project">
         <h3>Cannabis Retail Data Synthesizer (Python)</h3>
         <p>This project contains <a href="code/python/cannabis_initial_load.py">a Python script</a> 
             for generating retail transactions appropriate to industry reported sales in cannabis. The initial
             load created about a year's worth of sales and each night in Big Query 
             <a href="code/python/cannabis_nightly.py">more daily data</a>  is added.</p>
-        <p>A write-up can be found on <a href="https://www.linkedin.com/pulse/my-accent-python-theo-callahan-yrhic/">LinkedIn</a></p>
+        <p>A full write-up can be found on <a href="https://www.linkedin.com/pulse/my-accent-python-theo-callahan-yrhic/">LinkedIn</a></p>
         
-    </div>
-
-    <h2>Featured Projects</h2>
-
-    <div class="project">
-        <h3>US Baby Names Analysis (1921-2021)</h3>
-        <p>Interactive Power BI dashboard exploring 100 years of naming trends, including how names like "Charlie"
-            shifted from 90% male to 60% female over time.</p>
-        <p><a href="https://app.powerbi.com/view?r=eyJrIjoiNTE5NjI5YmYtNDZkMy00MWRmLTk2ZDYtZDgxYzA1ZGYwOWQzIiwidCI6ImNmOGM1NzBlLTFlMjYtNDczMi04ZTNiLWVhYjI0ODAyNTI3MyIsImMiOjZ9"
-                target="_blank">View Dashboard →</a></p>
     </div>
 
     <div class="project">
         <h3>Static Pool Analysis circa 2008</h3>
+        <h4>What will my auto load defaults be in six months?</h4>
+        
+        <img src="images/staticpoolresults.png" alt="Charge Offs trend chart" class="project-image">
         <p>This project contains <a href="code/python/auto_loan_static_pool_generator.py">a Python script</a> for generating reasonable static pool data 
             from around the time of the 2008 financial crisis and a <a href="https://app.powerbi.com/groups/me/reports/3d02b3fa-4b0a-45b6-afe1-31e19005f4f9/6990497e49900b417209?experience=power-bi"
                 target="_blank">Power BI dashboard</a> to view the results.</p>
-        <p>A write-up can be found on <a href="https://www.linkedin.com/pulse/work-sound-theo-callahan-z42qc/">LinkedIn</a></p>
-        
+
+                The chart is both a rearview mirror and a windshield. Fully seasoned tranches tell you what happened. 
+                Incomplete tranches, tracked against those benchmarks, tell you what is probably coming.
+        <p>A full write-up can be found on <a href="https://www.linkedin.com/pulse/work-sound-theo-callahan-z42qc/">LinkedIn</a></p>
     </div>
+
+    <div class="project">
+        <h3>US Baby Names Analysis (1921-2021)</h3>
+
+        <img src="images/CharlieCropped.png" alt="Charlie name trend chart" class="project-image">
+
+        <p>Interactive Power BI dashboard exploring 100 years of naming trends, including how names like "Charlie"
+            shifted from 90% male to 60% female over time.</p>
+
+        <a href="projects/baby-names.html">Details</a><p></p>
+
+        <p><a href="https://app.powerbi.com/view?r=eyJrIjoiNTE5NjI5YmYtNDZkMy00MWRmLTk2ZDYtZDgxYzA1ZGYwOWQzIiwidCI6ImNmOGM1NzBlLTFlMjYtNDczMi04ZTNiLWVhYjI0ODAyNTI3MyIsImMiOjZ9"
+                target="_blank">Interactive Dashboard in Power BI →</a></p>
+    </div>
+
+
 
     <div class="project">
         <h3>How many times have I been to the gym?</h3>
